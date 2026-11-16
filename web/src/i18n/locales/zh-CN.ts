@@ -172,8 +172,6 @@ export default {
         clipboardAdded: "已读取 {{count}} 张参考图",
         promptRequired: "请输入生图提示词",
         configIncomplete: "生图配置不完整",
-        invalidParams: "生图参数无效",
-        busy: "生图工作台已有任务正在运行",
         generated: "图片已生成",
         addedReference: "已加入参考图",
         resultTitle: "生成结果 {{count}}",
@@ -183,6 +181,8 @@ export default {
         empty: "还没有生成图片",
         resultAlt: "生成结果 {{count}}",
         addReference: "加入参考图",
+        runningTasks: "{{count}} 个任务生成中",
+        backToTasks: "返回当前任务",
     },
     videoWorkbench: {
         title: "视频创作台",

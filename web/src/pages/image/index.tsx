@@ -40,6 +40,16 @@ type GenerationResult = {
     error?: string;
 };
 
+type GenerationSnapshot = { text: string; config: AiConfig; references: ReferenceImage[] };
+
+type GenerationBatch = {
+    id: string;
+    startedAt: number;
+    durationMs: number;
+    snapshot: GenerationSnapshot;
+    results: GenerationResult[];
+};
+
 type GenerationLog = {
     id: string;
     createdAt: number;
@@ -81,15 +91,13 @@ export default function ImagePage() {
     const addAsset = useAssetStore((state) => state.addAsset);
     const [prompt, setPrompt] = useState("");
     const [references, setReferences] = useState<ReferenceImage[]>([]);
-    const [results, setResults] = useState<GenerationResult[]>([]);
+    const [batches, setBatches] = useState<GenerationBatch[]>([]);
     const [logs, setLogs] = useState<GenerationLog[]>([]);
-    const [running, setRunning] = useState(false);
     const [logsOpen, setLogsOpen] = useState(false);
     const [settingsOpen, setSettingsOpen] = useState(false);
     const [promptDialogOpen, setPromptDialogOpen] = useState(false);
     const [assetPickerOpen, setAssetPickerOpen] = useState(false);
-    const [startedAt, setStartedAt] = useState(0);
-    const [elapsedMs, setElapsedMs] = useState(0);
+    const [now, setNow] = useState(0);
     const [selectedLogIds, setSelectedLogIds] = useState<string[]>([]);
     const [previewLog, setPreviewLog] = useState<GenerationLog | null>(null);
     const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
@@ -104,12 +112,13 @@ export default function ImagePage() {
     const model = effectiveConfig.imageModel || effectiveConfig.model;
     const canGenerate = Boolean(prompt.trim());
     const generationCount = Math.max(1, Math.min(10, Number(config.count) || 1));
+    const runningCount = batches.filter(isBatchRunning).length;
 
     useEffect(() => {
-        if (!running || !startedAt) return;
-        const timer = window.setInterval(() => setElapsedMs(performance.now() - startedAt), 1000);
+        if (!runningCount) return;
+        const timer = window.setInterval(() => setNow(performance.now()), 1000);
         return () => window.clearInterval(timer);
-    }, [running, startedAt]);
+    }, [runningCount > 0]);
 
     useEffect(() => {
         void refreshLogs();
@@ -163,23 +172,18 @@ export default function ImagePage() {
             return;
         }
 
-        const snapshot = buildRequestSnapshot();
-        if (!snapshot) {
-            if (agentTaskId) updateAgentTask(agentTaskId, { status: "failed", error: t("imageWorkbench.invalidParams") });
-            return;
-        }
-
-        setElapsedMs(0);
-        setRunning(true);
+        // 每次点击生成独立批次，与正在运行的批次并行，互不阻塞。
+        const snapshot: GenerationSnapshot = { text, config: { ...effectiveConfig, model, count: "1" }, references: [...references] };
+        const batchStartedAt = performance.now();
+        const batch: GenerationBatch = { id: nanoid(), startedAt: batchStartedAt, durationMs: 0, snapshot, results: Array.from({ length: generationCount }, () => ({ id: nanoid(), status: "pending" })) };
         if (agentTaskId) updateAgentTask(agentTaskId, { status: "running", error: undefined });
         setPreviewLog(null);
-        setResults(Array.from({ length: generationCount }, () => ({ id: nanoid(), status: "pending" })));
-        const batchStartedAt = performance.now();
-        setStartedAt(batchStartedAt);
+        setNow(batchStartedAt);
+        setBatches((value) => [batch, ...value]);
 
-        const tasks = Array.from({ length: generationCount }, (_, index) => runGenerationSlot(index, snapshot));
-
-        const result = await Promise.allSettled(tasks);
+        const result = await Promise.allSettled(batch.results.map((item) => runGenerationSlot(batch.id, item.id, snapshot)));
+        const durationMs = performance.now() - batchStartedAt;
+        setBatches((value) => value.map((item) => (item.id === batch.id ? { ...item, durationMs } : item)));
         const successImages = result.filter((item): item is PromiseFulfilledResult<GeneratedImage> => item.status === "fulfilled").map((item) => item.value);
         const successCount = successImages.length;
         const failCount = generationCount - successCount;
@@ -187,24 +191,20 @@ export default function ImagePage() {
         const error = failed?.reason instanceof Error ? failed.reason.message : failCount ? t("workbench.generationFailed") : undefined;
         if (agentTaskId) updateAgentTask(agentTaskId, { status: successCount ? "succeeded" : "failed", successCount, failCount, error: successCount ? undefined : error });
 
-        try {
-            saveLog(
-                buildLog({
-                    prompt: text,
-                    model,
-                    config: { ...snapshot.config, count: String(generationCount) },
-                    references: snapshot.references,
-                    durationMs: performance.now() - batchStartedAt,
-                    successCount,
-                    failCount,
-                    status: successCount ? "success" : "failed",
-                    images: successImages,
-                }),
-            );
-            successCount ? message.success(t("imageWorkbench.generated")) : message.error(failed?.reason instanceof Error ? failed.reason.message : t("workbench.generationFailed"));
-        } finally {
-            setRunning(false);
-        }
+        saveLog(
+            buildLog({
+                prompt: text,
+                model,
+                config: { ...snapshot.config, count: String(generationCount) },
+                references: snapshot.references,
+                durationMs,
+                successCount,
+                failCount,
+                status: successCount ? "success" : "failed",
+                images: successImages,
+            }),
+        );
+        successCount ? message.success(t("imageWorkbench.generated")) : message.error(failed?.reason instanceof Error ? failed.reason.message : t("workbench.generationFailed"));
     };
 
     // Handle image-generation commands from the Agent panel by setting the prompt and optionally starting generation.
@@ -213,15 +213,11 @@ export default function ImagePage() {
         processedCommandRef.current = imageCommand.nonce;
         clearImageCommand();
         if (typeof imageCommand.prompt === "string") setPrompt(imageCommand.prompt);
-        if (imageCommand.run && running) {
-            if (imageCommand.taskId) updateAgentTask(imageCommand.taskId, { status: "failed", error: t("imageWorkbench.busy") });
-            return;
-        }
         if (imageCommand.run) {
             agentTaskIdRef.current = imageCommand.taskId;
             setAutoRunToken((value) => value + 1);
         }
-    }, [imageCommand, clearImageCommand, running, updateAgentTask]);
+    }, [imageCommand, clearImageCommand]);
 
     useEffect(() => {
         if (!autoRunToken) return;
@@ -268,9 +264,7 @@ export default function ImagePage() {
     const createSession = () => {
         setPrompt("");
         setReferences([]);
-        setResults([]);
-        setElapsedMs(0);
-        setStartedAt(0);
+        setBatches((value) => value.filter(isBatchRunning));
         setSelectedLogIds([]);
         setPreviewLog(null);
     };
@@ -278,10 +272,7 @@ export default function ImagePage() {
     const deleteSelectedLogs = () => {
         const imageKeys = logs.filter((log) => selectedLogIds.includes(log.id)).flatMap((log) => log.images.map((image) => image.storageKey).filter((key): key is string => Boolean(key)));
         void Promise.all([deleteStoredImages(imageKeys), ...selectedLogIds.map((id) => logStore.removeItem(id))]).then(refreshLogs);
-        if (previewLog && selectedLogIds.includes(previewLog.id)) {
-            setPreviewLog(null);
-            setResults([]);
-        }
+        if (previewLog && selectedLogIds.includes(previewLog.id)) setPreviewLog(null);
         setSelectedLogIds([]);
         setDeleteConfirmOpen(false);
     };
@@ -301,24 +292,9 @@ export default function ImagePage() {
         if (log.config.quality) updateConfig("quality", log.config.quality);
         if (log.config.size) updateConfig("size", log.config.size);
         if (log.config.count) updateConfig("count", log.config.count);
-        setResults(log.images.map((image) => ({ id: image.id, status: "success", image })));
     };
 
-    const buildRequestSnapshot = () => {
-        const text = prompt.trim();
-        if (!text) {
-            message.error(t("imageWorkbench.promptRequired"));
-            return null;
-        }
-        if (!isAiConfigReady(effectiveConfig, model)) {
-            message.warning(t("workbench.configFirst"));
-            openConfigDialog(true);
-            return null;
-        }
-        return { text, config: { ...effectiveConfig, model, count: "1" }, references: [...references] };
-    };
-
-    const runGenerationSlot = async (index: number, snapshot: { text: string; config: AiConfig; references: ReferenceImage[] }) => {
+    const runGenerationSlot = async (batchId: string, resultId: string, snapshot: GenerationSnapshot) => {
         const itemStartedAt = performance.now();
         try {
             const result = snapshot.references.length ? await requestEdit(snapshot.config, snapshot.text, snapshot.references) : await requestGeneration(snapshot.config, snapshot.text);
@@ -326,26 +302,33 @@ export default function ImagePage() {
             if (!image) throw new Error(t("imageWorkbench.missingResult"));
             const stored = await uploadImage(image.dataUrl);
             const nextImage: GeneratedImage = { id: image.id, dataUrl: stored.url, ...(stored.storageKey ? { storageKey: stored.storageKey } : {}), durationMs: performance.now() - itemStartedAt, width: stored.width, height: stored.height, bytes: stored.bytes, mimeType: stored.mimeType };
-            setResults((value) => updateResultAt(value, index, { status: "success", image: nextImage }));
+            setBatches((value) => updateBatchResult(value, batchId, resultId, { status: "success", image: nextImage }));
             return nextImage;
         } catch (error) {
-            setResults((value) => updateResultAt(value, index, { status: "failed", error: error instanceof Error ? error.message : t("workbench.generationFailed") }));
+            setBatches((value) => updateBatchResult(value, batchId, resultId, { status: "failed", error: error instanceof Error ? error.message : t("workbench.generationFailed") }));
             throw error;
         }
     };
 
-    const retryResult = async (index: number) => {
-        const snapshot = buildRequestSnapshot();
-        if (!snapshot) return;
-        setPreviewLog(null);
-        setResults((value) => updateResultAt(value, index, { status: "pending", error: undefined, image: undefined }));
+    // 重试沿用该批次发起时的提示词、参考图和参数，渠道凭据取最新配置。
+    const retryResult = async (batch: GenerationBatch, resultId: string) => {
+        const snapshot = { ...batch.snapshot, config: { ...batch.snapshot.config, channels: effectiveConfig.channels } };
+        if (!isAiConfigReady(snapshot.config, snapshot.config.model)) {
+            message.warning(t("workbench.configFirst"));
+            openConfigDialog(true);
+            return;
+        }
         const retryStartedAt = performance.now();
+        // 已结束的批次重试时重新计时，标签显示本次重试的等待与耗时。
+        const restart = !isBatchRunning(batch);
+        if (restart) setNow(retryStartedAt);
+        setBatches((value) => updateBatchResult(value, batch.id, resultId, { status: "pending", error: undefined, image: undefined }).map((item) => (restart && item.id === batch.id ? { ...item, startedAt: retryStartedAt } : item)));
         try {
-            const image = await runGenerationSlot(index, snapshot);
+            const image = await runGenerationSlot(batch.id, resultId, snapshot);
             saveLog(
                 buildLog({
                     prompt: snapshot.text,
-                    model,
+                    model: snapshot.config.model,
                     config: { ...snapshot.config, count: "1" },
                     references: snapshot.references,
                     durationMs: performance.now() - retryStartedAt,
@@ -359,6 +342,7 @@ export default function ImagePage() {
         } catch {
             // runGenerationSlot has already marked the result as failed.
         }
+        if (restart) setBatches((value) => value.map((item) => (item.id === batch.id ? { ...item, durationMs: performance.now() - retryStartedAt } : item)));
     };
 
     return (
@@ -484,7 +468,7 @@ export default function ImagePage() {
                         </div>
 
                         <div className="mt-auto pt-6">
-                            <Button type="primary" size="large" block icon={<Sparkles className="size-4" />} loading={running} disabled={!canGenerate || running} onClick={() => void generate()}>
+                            <Button type="primary" size="large" block icon={<Sparkles className="size-4" />} disabled={!canGenerate} onClick={() => void generate()}>
                                 {t("workbench.generate")}
                             </Button>
                         </div>
@@ -495,19 +479,44 @@ export default function ImagePage() {
                             <div>
                                 <h2 className="text-xl font-semibold">{t("workbench.results")}</h2>
                             </div>
-                            {running ? <Tag className="m-0 px-2 py-1">{t("workbench.waiting", { time: formatDuration(elapsedMs) })}</Tag> : null}
+                            <div className="flex items-center gap-2">
+                                {runningCount ? <Tag className="m-0 px-2 py-1">{t("imageWorkbench.runningTasks", { count: runningCount })}</Tag> : null}
+                                {previewLog && batches.length ? (
+                                    <Button size="small" onClick={() => setPreviewLog(null)}>
+                                        {t("imageWorkbench.backToTasks")}
+                                    </Button>
+                                ) : null}
+                            </div>
                         </div>
-                        {results.length ? (
+                        {previewLog ? (
                             <div className="grid gap-4 sm:grid-cols-2 2xl:grid-cols-3">
-                                {results.map((result, index) =>
-                                    result.status === "success" && result.image ? (
-                                        <ResultImageCard key={result.id} image={result.image} index={index} onEdit={addResultToReferences} onDownload={downloadImage} onSaveAsset={saveResultToAssets} />
-                                    ) : result.status === "failed" ? (
-                                        <FailedImageCard key={result.id} error={result.error || t("workbench.generationFailed")} onRetry={() => retryResult(index)} />
-                                    ) : (
-                                        <PendingImageCard key={result.id} />
-                                    ),
-                                )}
+                                {previewLog.images.map((image, index) => (
+                                    <ResultImageCard key={image.id} image={image} index={index} onEdit={addResultToReferences} onDownload={downloadImage} onSaveAsset={saveResultToAssets} />
+                                ))}
+                            </div>
+                        ) : batches.length ? (
+                            <div className="space-y-6">
+                                {batches.map((batch) => (
+                                    <div key={batch.id}>
+                                        <div className="mb-2 flex items-center justify-between gap-3">
+                                            <Typography.Text ellipsis className="min-w-0 text-sm text-stone-500 dark:text-stone-400">
+                                                {batch.snapshot.text}
+                                            </Typography.Text>
+                                            <Tag className="m-0 shrink-0">{isBatchRunning(batch) ? t("workbench.waiting", { time: formatDuration(Math.max(0, now - batch.startedAt)) }) : formatDuration(batch.durationMs)}</Tag>
+                                        </div>
+                                        <div className="grid gap-4 sm:grid-cols-2 2xl:grid-cols-3">
+                                            {batch.results.map((result, index) =>
+                                                result.status === "success" && result.image ? (
+                                                    <ResultImageCard key={result.id} image={result.image} index={index} onEdit={addResultToReferences} onDownload={downloadImage} onSaveAsset={saveResultToAssets} />
+                                                ) : result.status === "failed" ? (
+                                                    <FailedImageCard key={result.id} error={result.error || t("workbench.generationFailed")} onRetry={() => void retryResult(batch, result.id)} />
+                                                ) : (
+                                                    <PendingImageCard key={result.id} />
+                                                ),
+                                            )}
+                                        </div>
+                                    </div>
+                                ))}
                             </div>
                         ) : (
                             <div className="flex min-h-[320px] flex-col items-center justify-center rounded-lg border border-dashed border-stone-300 text-center dark:border-stone-700 lg:min-h-[560px]">
@@ -657,8 +666,12 @@ function FailedImageCard({ error, onRetry }: { error: string; onRetry: () => voi
     );
 }
 
-function updateResultAt(results: GenerationResult[], index: number, next: Partial<GenerationResult>) {
-    return results.map((item, itemIndex) => (itemIndex === index ? { ...item, ...next } : item));
+function isBatchRunning(batch: GenerationBatch) {
+    return batch.results.some((item) => item.status === "pending");
+}
+
+function updateBatchResult(batches: GenerationBatch[], batchId: string, resultId: string, next: Partial<GenerationResult>) {
+    return batches.map((batch) => (batch.id === batchId ? { ...batch, results: batch.results.map((item) => (item.id === resultId ? { ...item, ...next } : item)) } : batch));
 }
 
 function LogPanel({

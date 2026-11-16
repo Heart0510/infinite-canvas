@@ -172,8 +172,6 @@ export default {
         clipboardAdded: "Added {{count}} reference images",
         promptRequired: "Enter an image prompt",
         configIncomplete: "Image generation configuration is incomplete",
-        invalidParams: "Invalid image generation parameters",
-        busy: "The Image Studio is already running a task",
         generated: "Images generated",
         addedReference: "Added to reference images",
         resultTitle: "Generated image {{count}}",
@@ -183,6 +181,8 @@ export default {
         empty: "No images generated yet",
         resultAlt: "Generated image {{count}}",
         addReference: "Add as reference",
+        runningTasks: "{{count}} tasks generating",
+        backToTasks: "Back to current tasks",
     },
     videoWorkbench: {
         title: "Video Studio",
