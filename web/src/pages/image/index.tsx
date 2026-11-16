@@ -272,6 +272,15 @@ export default function ImagePage() {
     const deleteSelectedLogs = () => {
         const imageKeys = logs.filter((log) => selectedLogIds.includes(log.id)).flatMap((log) => log.images.map((image) => image.storageKey).filter((key): key is string => Boolean(key)));
         void Promise.all([deleteStoredImages(imageKeys), ...selectedLogIds.map((id) => logStore.removeItem(id))]).then(refreshLogs);
+        // 图片已随记录删除，结果区同步移除引用这些图片的卡片；批次只剩失败卡片时整批移除。
+        const deletedKeys = new Set(imageKeys);
+        setBatches((value) =>
+            value.flatMap((batch) => {
+                const results = batch.results.filter((item) => !(item.image?.storageKey && deletedKeys.has(item.image.storageKey)));
+                if (results.length === batch.results.length) return [batch];
+                return results.some((item) => item.status !== "failed") ? [{ ...batch, results }] : [];
+            }),
+        );
         if (previewLog && selectedLogIds.includes(previewLog.id)) setPreviewLog(null);
         setSelectedLogIds([]);
         setDeleteConfirmOpen(false);
